@@ -93,13 +93,64 @@ function expandSynonyms(q) {
 async function loadDynamicPage(url) {
   const browser = await puppeteer.launch({
     headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--lang=ru-RU,ru",
+      "--disable-dev-shm-usage"
+    ]
   });
+
   const page = await browser.newPage();
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
-  // Если знаешь точный контейнер — можешь раскомментировать:
-  // await page.waitForSelector('main, .document, .content, .law', { timeout: 30000 });
-  const html = await page.content(); // уже «пререндеренный» HTML
+  await page.setUserAgent(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+  );
+  await page.setExtraHTTPHeaders({ "Accept-Language": "ru-RU,ru;q=0.9" });
+
+  // грузим страницу и ждём сети
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
+
+  // 1) пробуем дождаться явных контейнеров на ТЕКУЩЕЙ странице
+  const selectors = [
+    "main", ".document", ".law", ".content", ".text", "#content", ".doc", ".paper"
+  ];
+
+  let html = null;
+
+  for (const sel of selectors) {
+    try {
+      await page.waitForSelector(sel, { timeout: 8000 });
+      // есть контейнер на самой странице — берём контент
+      html = await page.content();
+      break;
+    } catch { /* игнор, пойдём дальше */ }
+  }
+
+  // 2) если пусто — значит внутри iframe. Считаем текст из всех фреймов
+  if (!html) {
+    const frames = page.frames();
+    for (const f of frames) {
+      try {
+        const got = await f.evaluate(() => {
+          const root =
+            document.querySelector("main,.document,.law,.content,.text,#content,.doc,.paper") ||
+            document.body;
+          return root ? root.innerText : "";
+        });
+        if (got && got.length > 2000) {
+          html = `<html><body><main>${got.replace(/&/g,"&amp;")
+                                          .replace(/</g,"&lt;")
+                                          .replace(/>/g,"&gt;")
+                                          .replace(/\n/g,"<br/>")}</main></body></html>`;
+          break;
+        }
+      } catch { /* фрейм мог быть кросс-доменным — пропускаем */ }
+    }
+  }
+
+  // 3) последний шанс — content() как есть
+  if (!html) html = await page.content();
+
   await browser.close();
   return html;
 }
@@ -170,12 +221,22 @@ let META = { loaded: 0 };
 
 async function loadOne(url, idx) {
   let html;
-  if (/adilet\.zan\.kz/i.test(url)) {
-    html = await loadDynamicPage(url);        // динамический сайт
-  } else {
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 TaxCodeBot/1.0" } });
-    if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
-    html = await r.text();
+  try {
+    if (/adilet\.zan\.kz/i.test(url)) {
+      html = await loadDynamicPage(url);           // динамический сайт
+    } else {
+      const r = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+          "Accept-Language": "ru-RU,ru;q=0.9"
+        }
+      });
+      if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
+      html = await r.text();
+    }
+  } catch (e) {
+    console.error("loadOne: navigation failed:", url, e.message);
+    throw e;
   }
 
   const text = extractTextHTML(html);
@@ -206,6 +267,19 @@ app.get("/health", (req, res) => {
 
 app.get("/sources", (req, res) => {
   res.json({ sources: ALLOWED });
+});
+
+// вернёт первую 1000 символов сырого текста первой секции (если есть)
+app.get("/debug/peek", (req, res) => {
+  if (!SECTIONS.length) return res.json({ sections: 0, sample: "" });
+  const s = SECTIONS[0];
+  res.json({ sections: SECTIONS.length, firstId: s.id, title: s.title, sample: s.text.slice(0, 1000) });
+});
+
+// список первых 150 заголовков
+app.get("/debug/titles", (req, res) => {
+  const list = SECTIONS.slice(0, 150).map(x => ({ id: x.id, title: x.title }));
+  res.json({ count: SECTIONS.length, titles: list });
 });
 
 // отладочный список заголовков (первые 120)
