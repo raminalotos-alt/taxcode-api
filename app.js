@@ -12,7 +12,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
-// --------- CORS для OpenAI Actions ---------
+// --------- CORS (для OpenAI Actions) ---------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -27,7 +27,7 @@ const CFG = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
 const ALLOWED = CFG.sources || [];
 if (!ALLOWED.length) console.warn("⚠️ sources.json пуст — добавь HTML-ссылки на кодекс");
 
-// --------- утилиты нормализации/поиска ---------
+// --------- нормализация / токены / «стем» ---------
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
@@ -97,13 +97,14 @@ async function loadDynamicPage(url) {
   });
   const page = await browser.newPage();
   await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
-  // Если знаешь конкретный контейнер — можно дождаться его:
-  // await page.waitForSelector('main, .document, .content', { timeout: 30000 });
+  // Если знаешь точный контейнер — можешь раскомментировать:
+  // await page.waitForSelector('main, .document, .content, .law', { timeout: 30000 });
   const html = await page.content(); // уже «пререндеренный» HTML
   await browser.close();
   return html;
 }
 
+// --------- извлечение текста из HTML (сохраняем переносы строк!) ---------
 function extractTextHTML(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
 
@@ -114,21 +115,32 @@ function extractTextHTML(html) {
     "#content", ".container", "main", "#main", ".doc"
   ];
 
+  function blocksToText(root) {
+    const parts = [];
+    $(root).find("h1,h2,h3,h4,p,li,td,pre,section,article,div").each((_, el) => {
+      const t = $(el).text().replace(/\s+/g, " ").trim();
+      if (t) parts.push(t);
+    });
+    return parts.join("\n");
+  }
+
   for (const sel of candidates) {
     if ($(sel).length) {
-      const txt = $(sel).find("h1,h2,h3,h4,p,li,td,pre,section,article,div").text();
-      const cleaned = txt.replace(/\s+/g, " ").trim();
+      const cleaned = blocksToText(sel).trim();
       if (cleaned.length > 2000) return cleaned;
     }
   }
 
-  const all = $("h1,h2,h3,h4,p,li,td,pre,section,article,div").text();
-  return all.replace(/\s+/g, " ").trim();
+  const all = blocksToText("body").trim();
+  return all;
 }
 
+// --------- разбиение на фрагменты (Статья/Глава/Раздел) ---------
 function splitIntoSections(rawText, url, docIndex) {
+  // критичный момент: разбиваем по заголовкам в НАЧАЛЕ СТРОК (многострочный режим)
+  const headerRe = /(?=^\s*(?:СТАТЬЯ|Статья|ГЛАВА|Глава|РАЗДЕЛ|Раздел)[\s\u00A0]*\d+(?:[.\:\-–—])?\s)/m;
   const chunks = rawText
-    .split(/(?=\b(статья|глава|раздел)\b[\s\d.:–—-]*)/gi)
+    .split(headerRe)
     .map(s => s.trim())
     .filter(Boolean);
 
@@ -138,7 +150,8 @@ function splitIntoSections(rawText, url, docIndex) {
   } else {
     let local = 1;
     for (const chunk of chunks) {
-      const title = chunk.slice(0, 140);
+      const firstLine = (chunk.split(/\n/, 1)[0] || "").slice(0, 180);
+      const title = firstLine || chunk.slice(0, 180);
       out.push({
         id: Number(`${docIndex + 1}${String(local).padStart(3, "0")}`),
         title,
@@ -195,6 +208,12 @@ app.get("/sources", (req, res) => {
   res.json({ sources: ALLOWED });
 });
 
+// отладочный список заголовков (первые 120)
+app.get("/debug/titles", (req, res) => {
+  const sample = SECTIONS.slice(0, 120).map(s => ({ id: s.id, title: s.title }));
+  res.json({ count: SECTIONS.length, titles: sample });
+});
+
 app.get("/section", (req, res) => {
   const id = Number(req.query.id);
   const s = SECTIONS.find(x => x.id === id);
@@ -210,6 +229,30 @@ app.post("/search", (req, res) => {
   const variants = expandSynonyms(q);
   const allHits = [];
 
+  // приоритетный матч "статья N" (учитываем формы и NBSP)
+  const numMatch = q.match(/стать[ьяи]\s*№?\s*(\d{1,4})/iu);
+  if (numMatch) {
+    const num = numMatch[1];
+    const artRe = new RegExp(
+      `^\\s*(?:СТАТЬЯ|Статья)[\\s\\u00A0]*${num}(?:[\\.:\\-–—])?\\s`,
+      "m"
+    );
+    for (const s of SECTIONS) {
+      const m = s.text.match(artRe);
+      if (m) {
+        const pos = m.index ?? 0;
+        allHits.push({
+          id: s.id,
+          title: s.title,
+          url: s.url,
+          score: 999,
+          excerpt: makeSnippet(s.text, pos, pos + String(num).length + 20)
+        });
+      }
+    }
+  }
+
+  // обычный «мягкий» поиск (фразы + стем-слова)
   for (const v of variants) {
     const phrase = normalize(v);
     const terms = tokenize(v);
@@ -227,7 +270,7 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // fallback по числам (например, «статья 54»)
+  // fallback по числам (если вообще пусто)
   if (allHits.length === 0) {
     const nums = (q.match(/\d+/g) || []).slice(0, 2);
     for (const s of SECTIONS) {
@@ -244,7 +287,7 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // dedup по id: оставляем лучший score
+  // dedup по id: оставляем запись с максимальным score
   const dedup = new Map();
   for (const h of allHits) {
     const prev = dedup.get(h.id);
@@ -268,4 +311,3 @@ app.post("/reload", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`TaxCode API (Puppeteer) on ${PORT}, sections: ${META.loaded}`));
-
