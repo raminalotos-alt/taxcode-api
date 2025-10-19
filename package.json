@@ -1,0 +1,12 @@
+{
+  "name": "taxcode-api",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "app.js",
+  "scripts": { "start": "node app.js" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pdf-parse": "^1.1.1",
+    "node-fetch": "^3.3.2"
+  }
+}
