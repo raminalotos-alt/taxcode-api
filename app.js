@@ -1,12 +1,11 @@
 // app.js — TaxCode API (Playwright edition: deep text + shadow DOM + iframes)
-
+import { chromium } from "playwright";
 import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
-import { chromium } from "playwright";
 
 // ====== setup ======
 const __filename = fileURLToPath(import.meta.url);
