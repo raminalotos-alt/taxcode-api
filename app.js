@@ -4,6 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
+import puppeteer from "puppeteer";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,7 +12,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
-// ---- CORS для OpenAI Actions
+// --------- CORS для OpenAI Actions ---------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -20,13 +21,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- конфиг источников (только HTML)
+// --------- источники ---------
 const cfgPath = path.join(__dirname, "sources.json");
 const CFG = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
 const ALLOWED = CFG.sources || [];
-if (!ALLOWED.length) console.warn("⚠️ sources.json пуст — добавь хотя бы одну HTML-ссылку.");
+if (!ALLOWED.length) console.warn("⚠️ sources.json пуст — добавь HTML-ссылки на кодекс");
 
-// ===== утилиты нормализации / поиска =====
+// --------- утилиты нормализации/поиска ---------
 function normalize(s) {
   return String(s || "")
     .toLowerCase()
@@ -88,34 +89,29 @@ function expandSynonyms(q) {
   return Array.from(new Set(out));
 }
 
-// ===== парсинг HTML =====
-async function fetchWithTimeout(url, ms = 20000) {
-  const ctrl = new AbortController();
-  const tm = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const r = await fetch(url, {
-      signal: ctrl.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; TaxCodeBot/1.0)",
-        "Accept": "text/html,application/xhtml+xml"
-      }
-    });
-    return r;
-  } finally {
-    clearTimeout(tm);
-  }
+// --------- рендер динамической страницы как браузер ---------
+async function loadDynamicPage(url) {
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+  // Если знаешь конкретный контейнер — можно дождаться его:
+  // await page.waitForSelector('main, .document, .content', { timeout: 30000 });
+  const html = await page.content(); // уже «пререндеренный» HTML
+  await browser.close();
+  return html;
 }
 
 function extractTextHTML(html) {
-  // вытащим основной текст с помощью cheerio
   const $ = cheerio.load(html, { decodeEntities: false });
 
-  // убираем скрипты/стили/навигацию
   $("script, style, noscript, header, nav, footer").remove();
 
-  // если на странице есть очевидные контейнеры — пробуем их сначала
   const candidates = [
-    ".document", ".law", ".content", ".article", ".text", "#content", ".container", "main"
+    ".document", ".law", ".content", ".article", ".text",
+    "#content", ".container", "main", "#main", ".doc"
   ];
 
   for (const sel of candidates) {
@@ -126,12 +122,10 @@ function extractTextHTML(html) {
     }
   }
 
-  // фолбэк: весь видимый текст
   const all = $("h1,h2,h3,h4,p,li,td,pre,section,article,div").text();
   return all.replace(/\s+/g, " ").trim();
 }
 
-// Разбиение на фрагменты: «Статья/Глава/Раздел …»
 function splitIntoSections(rawText, url, docIndex) {
   const chunks = rawText
     .split(/(?=\b(статья|глава|раздел)\b[\s\d.:–—-]*)/gi)
@@ -157,14 +151,20 @@ function splitIntoSections(rawText, url, docIndex) {
   return out;
 }
 
-// ===== загрузка всех источников =====
+// --------- загрузка всех источников ---------
 let SECTIONS = [];
 let META = { loaded: 0 };
 
 async function loadOne(url, idx) {
-  const r = await fetchWithTimeout(url);
-  if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
-  const html = await r.text();
+  let html;
+  if (/adilet\.zan\.kz/i.test(url)) {
+    html = await loadDynamicPage(url);        // динамический сайт
+  } else {
+    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 TaxCodeBot/1.0" } });
+    if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
+    html = await r.text();
+  }
+
   const text = extractTextHTML(html);
   return splitIntoSections(text, url, idx);
 }
@@ -186,7 +186,7 @@ async function loadAll() {
 
 await loadAll();
 
-// ===== endpoints =====
+// --------- endpoints ---------
 app.get("/health", (req, res) => {
   res.json({ status: "ok", sources: ALLOWED.length, sections: META.loaded });
 });
@@ -227,7 +227,7 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // fallback по числам (например, «статья 53»)
+  // fallback по числам (например, «статья 54»)
   if (allHits.length === 0) {
     const nums = (q.match(/\d+/g) || []).slice(0, 2);
     for (const s of SECTIONS) {
@@ -244,7 +244,7 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // dedup по id с максимальным score
+  // dedup по id: оставляем лучший score
   const dedup = new Map();
   for (const h of allHits) {
     const prev = dedup.get(h.id);
@@ -267,4 +267,5 @@ app.post("/reload", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`TaxCode API (HTML) on ${PORT}, sections: ${META.loaded}`));
+app.listen(PORT, () => console.log(`TaxCode API (Puppeteer) on ${PORT}, sections: ${META.loaded}`));
+
