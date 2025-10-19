@@ -1,6 +1,6 @@
-// app.js — TaxCode API (Puppeteer edition)
-// ----------------------------------------
+// app.js — TaxCode API (Puppeteer + deep text + shadow DOM)
 
+// -------------------- imports --------------------
 import express from "express";
 import fs from "fs";
 import path from "path";
@@ -9,13 +9,14 @@ import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import puppeteer from "puppeteer";
 
+// -------------------- setup ----------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
 
-// ---------- CORS для OpenAI Actions ----------
+// CORS для OpenAI Actions
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -24,25 +25,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- источники ----------
+// источники
 const cfgPath = path.join(__dirname, "sources.json");
 const CFG = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
 const ALLOWED = CFG.sources || [];
-if (!ALLOWED.length) console.warn("⚠️ sources.json пуст — добавь HTML-ссылки на кодекс (Adilet).");
+if (!ALLOWED.length) console.warn("⚠️ sources.json пуст — добавь ссылки Adilet.");
 
-// ---------- утилиты нормализации/поиска ----------
+// -------------------- utils ----------------------
 function normalize(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/ё/g, "е")
-    .replace(/\s+/g, " ")
-    .trim();
+  return String(s || "").toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
 }
 function tokenize(s) {
-  return normalize(s)
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .split(" ")
-    .filter(Boolean);
+  return normalize(s).replace(/[^\p{L}\p{N}\s]/gu, " ").split(" ").filter(Boolean);
 }
 function stemRegex(word) {
   const w = word.normalize("NFC");
@@ -91,7 +85,8 @@ function expandSynonyms(q) {
   return Array.from(new Set(out));
 }
 
-// ---------- рендер динамической страницы (ожидание контейнеров + iframe) ----------
+// -------------------- dynamic page loader ----------------------
+// Глубокое извлечение: учитываем shadow DOM и iframe
 async function loadDynamicPage(url) {
   const browser = await puppeteer.launch({
     headless: "new",
@@ -111,89 +106,133 @@ async function loadDynamicPage(url) {
 
   await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
 
-  const selectors = [
-    "main", ".document", ".law", ".content", ".text", "#content", ".doc", ".paper"
-  ];
-  let html = null;
-
-  // 1) пробуем найти контейнер на основной странице
-  for (const sel of selectors) {
-    try {
-      await page.waitForSelector(sel, { timeout: 8000 });
-      html = await page.content();
-      break;
-    } catch { /* попробуем дальше */ }
+  // ждём пока в body появится слово "Статья" (или "СТАТЬЯ")
+  try {
+    await page.waitForFunction(
+      () => /статья/i.test(document?.body?.innerText || ""),
+      { timeout: 60000 }
+    );
+  } catch (_) {
+    // не нашли за минуту — всё равно продолжим с тем, что есть
   }
 
-  // 2) если не нашли — читаем вложенные iframe
-  if (!html) {
-    const frames = page.frames();
-    for (const f of frames) {
-      try {
-        const got = await f.evaluate(() => {
-          const root =
-            document.querySelector("main,.document,.law,.content,.text,#content,.doc,.paper") ||
-            document.body;
-          return root ? root.innerText : "";
-        });
-        if (got && got.length > 2000) {
-          // оборачиваем innerText в минимальный HTML для дальнейшего парсинга
-          html = `<html><body><main>${got
-            .replace(/&/g,"&amp;")
-            .replace(/</g,"&lt;")
-            .replace(/>/g,"&gt;")
-            .replace(/\n/g,"<br/>")}</main></body></html>`;
-          break;
+  // Функция: собрать текст из DOM + всех shadowRoot
+  const deepInnerText = async (p) => {
+    return p.evaluate(() => {
+      const seen = new WeakSet();
+      const parts = [];
+
+      const collect = (root) => {
+        if (!root || seen.has(root)) return;
+        seen.add(root);
+
+        // Собираем текст блочных элементов
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
+        const blocks = [];
+        while (walker.nextNode()) {
+          const el = walker.currentNode;
+          const tag = (el.tagName || "").toLowerCase();
+          if (["h1","h2","h3","h4","p","li","td","pre","section","article","div","main"].includes(tag)) {
+            const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+            if (t) blocks.push(t);
+          }
+          // спускаемся в shadow DOM
+          if (el.shadowRoot) collect(el.shadowRoot);
         }
-      } catch { /* кросс-доменный фрейм — пропускаем */ }
+        parts.push(blocks.join("\n"));
+      };
+
+      collect(document.documentElement);
+      return parts.filter(Boolean).join("\n").trim();
+    });
+  };
+
+  // 1) Пробуем взять текст с основной страницы
+  let text = await deepInnerText(page);
+
+  // 2) Если текста мало — пробуем все фреймы (если не кросс-домен)
+  if (!text || text.length < 4000) {
+    for (const f of page.frames()) {
+      try {
+        const t = await f.evaluate(() => {
+          const seen = new WeakSet();
+          const parts = [];
+          const collect = (root) => {
+            if (!root || seen.has(root)) return;
+            seen.add(root);
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
+            const blocks = [];
+            while (walker.nextNode()) {
+              const el = walker.currentNode;
+              const tag = (el.tagName || "").toLowerCase();
+              if (["h1","h2","h3","h4","p","li","td","pre","section","article","div","main"].includes(tag)) {
+                const tt = (el.innerText || "").replace(/\s+/g, " ").trim();
+                if (tt) blocks.push(tt);
+              }
+              if (el.shadowRoot) collect(el.shadowRoot);
+            }
+            parts.push(blocks.join("\n"));
+          };
+          collect(document.documentElement);
+          return parts.filter(Boolean).join("\n").trim();
+        });
+        if (t && t.length > (text?.length || 0)) text = t;
+      } catch {
+        // кросс-доменный фрейм — пропускаем
+      }
     }
   }
 
-  // 3) последний шанс — весь content() как есть
-  if (!html) html = await page.content();
-
   await browser.close();
-  return html;
+
+  // Превращаем «чистый текст» в html для парсинга ниже
+  if (text && text.length > 0) {
+    const safe = text
+      .replace(/&/g,"&amp;")
+      .replace(/</g,"&lt;")
+      .replace(/>/g,"&gt;")
+      .replace(/\n/g,"<br/>");
+    return `<html><body><main>${safe}</main></body></html>`;
+  }
+
+  // fallback — пусто
+  return await page.content();
 }
 
-// ---------- извлечение текста (сохраняем переносы строк) ----------
+// -------------------- extract text ----------------------
 function extractTextHTML(html) {
   const $ = cheerio.load(html, { decodeEntities: false });
   $("script, style, noscript, header, nav, footer").remove();
 
-  const candidates = [
-    ".document", ".law", ".content", ".article", ".text",
-    "#content", ".container", "main", "#main", ".doc", ".paper"
-  ];
-
   function blocksToText(root) {
     const parts = [];
-    $(root).find("h1,h2,h3,h4,p,li,td,pre,section,article,div").each((_, el) => {
+    $(root).find("h1,h2,h3,h4,p,li,td,pre,section,article,div,main").each((_, el) => {
       const t = $(el).text().replace(/\s+/g, " ").trim();
       if (t) parts.push(t);
     });
     return parts.join("\n");
   }
 
+  const candidates = [
+    "main", ".document", ".law", ".content", ".article", ".text",
+    "#content", ".container", "#main", ".doc", ".paper", "body"
+  ];
+
   for (const sel of candidates) {
     if ($(sel).length) {
       const cleaned = blocksToText(sel).trim();
-      if (cleaned.length > 2000) return cleaned;
+      if (cleaned.length > 1000) return cleaned;
     }
   }
 
-  const all = blocksToText("body").trim();
+  const all = $("body").text().replace(/\s+/g, " ").trim();
   return all;
 }
 
-// ---------- разбиение на фрагменты (Статья/Глава/Раздел) ----------
+// -------------------- split into sections ----------------------
 function splitIntoSections(rawText, url, docIndex) {
-  // Разбиваем по заголовкам в начале строк (учёт NBSP и разных знаков)
   const headerRe = /(?=^\s*(?:СТАТЬЯ|Статья|ГЛАВА|Глава|РАЗДЕЛ|Раздел)[\s\u00A0]*\d+(?:[.\:\-–—])?\s)/m;
-  const chunks = rawText
-    .split(headerRe)
-    .map(s => s.trim())
-    .filter(Boolean);
+  const chunks = rawText.split(headerRe).map(s => s.trim()).filter(Boolean);
 
   const out = [];
   if (chunks.length <= 1) {
@@ -201,8 +240,8 @@ function splitIntoSections(rawText, url, docIndex) {
   } else {
     let local = 1;
     for (const chunk of chunks) {
-      const firstLine = (chunk.split(/\n/, 1)[0] || "").slice(0, 180);
-      const title = firstLine || chunk.slice(0, 180);
+      const firstLine = (chunk.split(/\n/, 1)[0] || "").slice(0, 200);
+      const title = firstLine || chunk.slice(0, 200);
       out.push({
         id: Number(`${docIndex + 1}${String(local).padStart(3, "0")}`),
         title,
@@ -215,28 +254,23 @@ function splitIntoSections(rawText, url, docIndex) {
   return out;
 }
 
-// ---------- загрузка всех источников ----------
+// -------------------- load all sources ----------------------
 let SECTIONS = [];
 let META = { loaded: 0 };
 
 async function loadOne(url, idx) {
   let html;
-  try {
-    if (/adilet\.zan\.kz/i.test(url)) {
-      html = await loadDynamicPage(url); // динамический сайт
-    } else {
-      const r = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-          "Accept-Language": "ru-RU,ru;q=0.9"
-        }
-      });
-      if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
-      html = await r.text();
-    }
-  } catch (e) {
-    console.error("loadOne: navigation failed:", url, e.message);
-    throw e;
+  if (/adilet\.zan\.kz/i.test(url)) {
+    html = await loadDynamicPage(url);
+  } else {
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9"
+      }
+    });
+    if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
+    html = await r.text();
   }
 
   const text = extractTextHTML(html);
@@ -260,7 +294,7 @@ async function loadAll() {
 
 await loadAll();
 
-// ---------- endpoints ----------
+// -------------------- endpoints ----------------------
 app.get("/health", (req, res) => {
   res.json({ status: "ok", sources: ALLOWED.length, sections: META.loaded });
 });
@@ -269,13 +303,11 @@ app.get("/sources", (req, res) => {
   res.json({ sources: ALLOWED });
 });
 
-// отладка: посмотреть первые 150 заголовков
 app.get("/debug/titles", (req, res) => {
   const list = SECTIONS.slice(0, 150).map(x => ({ id: x.id, title: x.title }));
   res.json({ count: SECTIONS.length, titles: list });
 });
 
-// отладка: глянуть начало текста первой секции
 app.get("/debug/peek", (req, res) => {
   if (!SECTIONS.length) return res.json({ sections: 0, sample: "" });
   const s = SECTIONS[0];
@@ -297,14 +329,11 @@ app.post("/search", (req, res) => {
   const variants = expandSynonyms(q);
   const allHits = [];
 
-  // приоритет: точное "статья N" (формы + NBSP)
+  // приоритет: "статья N"
   const numMatch = q.match(/стать[ьяи]\s*№?\s*(\d{1,4})/iu);
   if (numMatch) {
     const num = numMatch[1];
-    const artRe = new RegExp(
-      `^\\s*(?:СТАТЬЯ|Статья)[\\s\\u00A0]*${num}(?:[\\.:\\-–—])?\\s`,
-      "m"
-    );
+    const artRe = new RegExp(`^\\s*(?:СТАТЬЯ|Статья)[\\s\\u00A0]*${num}(?:[.\\:\\-–—])?\\s`, "m");
     for (const s of SECTIONS) {
       const m = s.text.match(artRe);
       if (m) {
@@ -320,7 +349,7 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // «мягкий» поиск по фразе и стем-состояниям
+  // обычный "мягкий" поиск
   for (const v of variants) {
     const phrase = normalize(v);
     const terms = tokenize(v);
@@ -338,7 +367,7 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // fallback: просто по цифрам
+  // fallback по цифрам
   if (allHits.length === 0) {
     const nums = (q.match(/\d+/g) || []).slice(0, 2);
     for (const s of SECTIONS) {
@@ -346,7 +375,10 @@ app.post("/search", (req, res) => {
         const idx = normalize(s.text).indexOf(n);
         if (idx >= 0) {
           allHits.push({
-            id: s.id, title: s.title, url: s.url, score: 5,
+            id: s.id,
+            title: s.title,
+            url: s.url,
+            score: 5,
             excerpt: makeSnippet(s.text, idx, idx + String(n).length)
           });
           break;
@@ -355,15 +387,13 @@ app.post("/search", (req, res) => {
     }
   }
 
-  // dedup по id — берём лучший score
+  // dedup по id
   const dedup = new Map();
   for (const h of allHits) {
     const prev = dedup.get(h.id);
     if (!prev || h.score > prev.score) dedup.set(h.id, h);
   }
-  const out = Array.from(dedup.values())
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+  const out = Array.from(dedup.values()).sort((a, b) => b.score - a.score).slice(0, limit);
 
   res.json({ result: out });
 });
@@ -377,8 +407,7 @@ app.post("/reload", async (req, res) => {
   }
 });
 
+// -------------------- start ----------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`TaxCode API (Puppeteer) on ${PORT}, sections: ${META.loaded}`)
-);
+app.listen(PORT, () => console.log(`TaxCode API on ${PORT}, sections: ${META.loaded}`));
 
